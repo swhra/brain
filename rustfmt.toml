@@ -1,0 +1,12 @@
+item_brace_style = "SameLineWhere"
+where_layout = "HorizontalVertical"
+array_width = 100
+struct_lit_width = 80
+fn_call_width = 100
+chain_width = 100
+struct_lit_force_lines = false
+edition = "2024"
+unstable_features = true
+format_code_in_doc_comments = true
+reorder_imports = true
+group_imports = "StdExternalCrate"
