@@ -1,0 +1,69 @@
+globals:
+  log_freq: 10 # 10 ticks, ergo 10 mins
+  synapses: 65536
+  tick_freq: 360 # 1 min
+
+drugs:
+  sertraline:
+    half_life_hours: 26.0
+    absorption_half_life_hours: 4.5
+    concentration_per_mg: 0.9
+
+components:
+  - { name: striatum, type: region }
+  - { name: striatum.serotonin, type: system, parent: striatum, params: { synthesis: 0.1, reuptake: 0.05 } }
+  - { name: striatum.serotonin.sert, type: receptor, parent: striatum.serotonin, params: { plasticity: 1.0e-8 } }
+  - { name: striatum.serotonin.5ht2c, type: receptor, parent: striatum.serotonin, receptor_type: presynaptic, params: { feedback: 1.2, plasticity: 5.0e-9 } }
+  - { name: striatum.dopamine, type: system, parent: striatum }
+  - { name: striatum.dopamine.dat, type: receptor, parent: striatum.dopamine }
+
+state:
+  sertraline_dose_mg: 0.0
+  striatum_serotonin_synthesis_rate: 0.1
+
+sensors:
+  - name: "unbound_sert_count"
+    metric: "mean(striatum.serotonin.sert::density * striatum.serotonin.sert::free_fraction)"
+  - name: "sert_occupancy_pct"
+    metric: "1.0 - mean(striatum.serotonin.sert::free_fraction)"
+  - name: "dat_occupancy_pct"
+    metric: "1.0 - mean(striatum.dopamine.dat::free_fraction)"
+  - name: "sert_activity_monitor"
+    metric: "mean(striatum.serotonin.sert::activity)"
+
+actuators:
+  - { name: "sertraline_dose", variable: "sertraline_dose_mg" }
+  - { name: "serotonin_synthesis_control", variable: "striatum_serotonin_synthesis_rate" }
+
+phases:
+  - description: "Baseline_NoDrug"
+    duration_days: 30
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 }
+
+  - description: "Stabilize_100mg"
+    duration_days: 60
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 100.0 } }
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 }
+
+  # --- 12-Month Hyperbolic Taper ---
+  - { description: "Taper_Step_1_50mg", duration_days: 60, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 50.0 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Step_2_25mg", duration_days: 60, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 25.0 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Step_3_12.5mg", duration_days: 60, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 12.5 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Step_4_6.25mg", duration_days: 60, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 6.25 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Step_5_3.125mg", duration_days: 60, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 3.125 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Step_6_1.56mg", duration_days: 65, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 1.56 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 } }] } # Total 365 days
+
+  - description: "Final_Washout"
+    duration_days: 60
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "0.5", kp: -0.001, ki: -0.0001, kd: 0.0, step: 0.0 }

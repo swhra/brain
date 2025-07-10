@@ -2,21 +2,48 @@ use std::collections::HashMap;
 use std::simd::{f32x8, num::SimdFloat as _};
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 use crate::drug::{Drug, Receptor};
 use crate::program::{self, Program};
 
 pub const SIMD_WIDTH: usize = 8;
-pub const TICKS_PER_DAY: u64 = 86400;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReceptorTickParams {
+    total_drug_binding: f32,
+    total_drug_activity_contrib: f32,
+}
+
+#[derive(Clone, Debug)]
+enum Instruction {
+    UpdateReceptor {
+        activity_ptr: *mut f32,
+        density_ptr: *mut f32,
+        free_fraction_ptr: *mut f32,
+        activity_setpoint_ptr: *mut f32,
+        parent_level_ptr: *const f32,
+        feedback_accumulator_ptr: *mut f32,
+        nt_affinity_ki_recip: f32,
+        plasticity_rate: f32,
+        feedback_strength: f32,
+        drug_params: Vec<(usize, f32, f32)>, // pk_idx, ki_recip, ia
+    },
+    UpdateSystem {
+        level_ptr: *mut f32,
+        feedback_accumulator_ptr: *const f32,
+        synthesis_rate_variable: String,
+        reuptake_eff: f32,
+    },
+}
 
 #[derive(Debug)]
 pub struct Brain {
     pub num_units: usize,
-    properties: Vec<f32>,
     receptor_update_plan: Vec<Instruction>,
     system_update_plan: Vec<Instruction>,
     metric_plans: HashMap<String, MetricPlan>,
+    receptor_tick_params: Vec<ReceptorTickParams>,
 }
 
 impl Brain {
@@ -25,9 +52,9 @@ impl Brain {
         drugs: &HashMap<String, Drug>,
         drug_order: &[String],
     ) -> Result<Self> {
-        let num_units = (protocol.globals.num_synaptic_units / SIMD_WIDTH) * SIMD_WIDTH;
+        let num_units = (protocol.globals.synapses / SIMD_WIDTH) * SIMD_WIDTH;
         if num_units == 0 {
-            return Err(anyhow!("num_synaptic_units must be >= {}", SIMD_WIDTH));
+            return Err(anyhow!("synapses must be >= {}", SIMD_WIDTH));
         }
 
         let mut property_map: HashMap<String, usize> = HashMap::new();
@@ -37,7 +64,7 @@ impl Brain {
             match component.component_type.as_str() {
                 "region" => {}
                 "system" => num_properties += 2,
-                "receptor" => num_properties += 3,
+                "receptor" => num_properties += 4, // activity, density, free_fraction, activity_setpoint
                 _ => anyhow::bail!("Unknown component type: {}", component.component_type),
             }
         }
@@ -54,6 +81,7 @@ impl Brain {
                 properties[start + num_units..start + 2 * num_units].fill(1.0);
             } else if component.component_type == "receptor" {
                 properties[start + num_units..start + 2 * num_units].fill(1.0);
+                properties[start + 3 * num_units..start + 4 * num_units].fill(0.0);
             }
         }
 
@@ -64,28 +92,33 @@ impl Brain {
 
         let receptor_components: Vec<_> =
             protocol.components.iter().filter(|c| c.component_type == "receptor").collect();
-        for component in receptor_components {
+        for component in &receptor_components {
             let params = &component.params;
             let base_idx = *property_map.get(&component.name).unwrap();
             let parent_base_idx = *property_map.get(component.parent.as_ref().unwrap()).unwrap();
 
-            let mut drug_effects = vec![];
-            if let Ok(receptor) = Receptor::from_str(&component.name) {
+            let mut drug_params = vec![];
+            let target_name = component.target.as_ref().unwrap_or(&component.name);
+            if let Ok(receptor) = Receptor::from_str(target_name) {
                 for (drug_name, drug) in drugs {
                     if let Some(target) = drug.targets.get(&receptor) {
-                        drug_effects.push((
+                        drug_params.push((
                             *pk_model_indices.get(drug_name).unwrap(),
-                            target.affinity_nm,
+                            1.0 / target.affinity_nm,
                             target.intrinsic_activity,
                         ));
                     }
                 }
             }
 
+            let nt_affinity_ki =
+                *params.get("affinity").unwrap_or(&1000.0);
+
             receptor_update_plan.push(Instruction::UpdateReceptor {
                 activity_ptr: unsafe { base_ptr.add(base_idx * num_units) },
                 density_ptr: unsafe { base_ptr.add((base_idx + 1) * num_units) },
                 free_fraction_ptr: unsafe { base_ptr.add((base_idx + 2) * num_units) },
+                activity_setpoint_ptr: unsafe { base_ptr.add((base_idx + 3) * num_units) },
                 parent_level_ptr: unsafe { base_ptr.add(parent_base_idx * num_units) },
                 feedback_accumulator_ptr: if component.receptor_type
                     == Some(program::ReceptorDef::Presynaptic)
@@ -94,10 +127,10 @@ impl Brain {
                 } else {
                     std::ptr::null_mut()
                 },
-                nt_affinity_ki: *params.get("affinity").unwrap_or(&1000.0),
+                nt_affinity_ki_recip: 1.0 / nt_affinity_ki,
                 plasticity_rate: *params.get("plasticity").unwrap_or(&1e-9),
                 feedback_strength: *params.get("feedback").unwrap_or(&1.0),
-                drug_effects,
+                drug_params,
             });
         }
 
@@ -124,107 +157,115 @@ impl Brain {
             );
         }
 
-        Ok(Self { num_units, properties, receptor_update_plan, system_update_plan, metric_plans })
+        let receptor_tick_params = vec![ReceptorTickParams::default(); receptor_update_plan.len()];
+
+        Ok(Self {
+            num_units,
+            receptor_update_plan,
+            system_update_plan,
+            metric_plans,
+            receptor_tick_params,
+        })
     }
 
-    #[inline(always)]
+    pub fn capture_activity_setpoints(&mut self) {
+        for instruction in &self.receptor_update_plan {
+            if let Instruction::UpdateReceptor { activity_ptr, activity_setpoint_ptr, .. } =
+                instruction
+            {
+                unsafe {
+                    let activity_slice = std::slice::from_raw_parts(*activity_ptr, self.num_units);
+                    let setpoint_slice =
+                        std::slice::from_raw_parts_mut(*activity_setpoint_ptr, self.num_units);
+                    setpoint_slice.copy_from_slice(activity_slice);
+                }
+            }
+        }
+    }
+
+    #[inline]
     pub fn tick(&mut self, drug_concentrations: &[f32], state: &HashMap<String, f32>) {
         let ones = f32x8::splat(1.0);
-        let point_fives = f32x8::splat(0.5);
         let zeros = f32x8::splat(0.0);
 
-        // PASS 0: INITIALIZE (Once per tick)
-        // Reset all feedback accumulators in one pass. This is fast.
         for instruction in &self.system_update_plan {
             if let Instruction::UpdateSystem { feedback_accumulator_ptr, .. } = instruction {
                 let acc_slice = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        *feedback_accumulator_ptr as *mut _,
-                        self.num_units,
-                    )
+                    std::slice::from_raw_parts_mut(*feedback_accumulator_ptr as *mut _, self.num_units)
                 };
                 acc_slice.fill(1.0);
             }
         }
 
-        // This `unsafe` block is safe because we've designed the passes to avoid data races.
-        // Pass 1 reads system levels and writes to receptor properties.
-        // Pass 2 reads receptor properties and writes to system levels.
+        for (idx, inst) in self.receptor_update_plan.iter().enumerate() {
+            if let Instruction::UpdateReceptor { drug_params, .. } = inst {
+                let mut params = ReceptorTickParams::default();
+                for (pk_idx, ki_recip, ia) in drug_params {
+                    let concentration = drug_concentrations[*pk_idx];
+                    let drug_binding = concentration * *ki_recip;
+                    params.total_drug_binding += drug_binding;
+                    params.total_drug_activity_contrib += drug_binding * *ia;
+                }
+                self.receptor_tick_params[idx] = params;
+            }
+        }
+
         unsafe {
-            // PASS 1: RECEPTORS (The "Up" Pass)
-            for instruction in &self.receptor_update_plan {
+            for (instruction, tick_params) in
+                self.receptor_update_plan.iter().zip(self.receptor_tick_params.iter())
+            {
                 if let Instruction::UpdateReceptor {
                     activity_ptr,
                     density_ptr,
                     free_fraction_ptr,
+                    activity_setpoint_ptr,
                     parent_level_ptr,
                     feedback_accumulator_ptr,
-                    nt_affinity_ki,
+                    nt_affinity_ki_recip,
                     plasticity_rate,
                     feedback_strength,
-                    drug_effects,
+                    ..
                 } = instruction
                 {
+                    let total_drug_binding = f32x8::splat(tick_params.total_drug_binding);
+                    let total_drug_activity_contrib =
+                        f32x8::splat(tick_params.total_drug_activity_contrib);
+                    let nt_affinity_ki_recip_simd = f32x8::splat(*nt_affinity_ki_recip);
+
                     for i in (0..self.num_units).step_by(SIMD_WIDTH) {
-                        let nt_levels = f32x8::from_slice(std::slice::from_raw_parts(
-                            parent_level_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
-                        let mut densities = f32x8::from_slice(std::slice::from_raw_parts(
-                            density_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
+                        let nt_levels =
+                            f32x8::from_slice(std::slice::from_raw_parts(parent_level_ptr.add(i), SIMD_WIDTH));
+                        let densities =
+                            f32x8::from_slice(std::slice::from_raw_parts(density_ptr.add(i), SIMD_WIDTH));
+                        let activity_setpoints =
+                            f32x8::from_slice(std::slice::from_raw_parts(activity_setpoint_ptr.add(i), SIMD_WIDTH));
 
-                        let nt_binding = nt_levels / f32x8::splat(*nt_affinity_ki);
-
-                        let mut total_drug_binding = zeros;
-                        let mut total_drug_activity_contrib = zeros;
-                        for (pk_idx, ki, ia) in drug_effects {
-                            let drug_binding = f32x8::splat(drug_concentrations[*pk_idx] / *ki);
-                            total_drug_binding += drug_binding;
-                            total_drug_activity_contrib += drug_binding * f32x8::splat(*ia);
-                        }
-
+                        let nt_binding = nt_levels * nt_affinity_ki_recip_simd;
                         let denominator = ones + nt_binding + total_drug_binding;
-                        let activities =
-                            (nt_binding + total_drug_activity_contrib) / denominator * densities;
-                        activities.copy_to_slice(std::slice::from_raw_parts_mut(
-                            activity_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
+                        let recip_denominator = ones / denominator;
 
-                        let free_fraction = ones / denominator;
-                        free_fraction.copy_to_slice(std::slice::from_raw_parts_mut(
-                            free_fraction_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
+                        let activities = (nt_binding + total_drug_activity_contrib)
+                            * recip_denominator
+                            * densities;
+                        activities.copy_to_slice(std::slice::from_raw_parts_mut(activity_ptr.add(i), SIMD_WIDTH));
 
-                        densities -=
-                            (activities - point_fives * densities) * f32x8::splat(*plasticity_rate);
-                        densities = densities.simd_clamp(f32x8::splat(0.2), f32x8::splat(3.0));
-                        densities.copy_to_slice(std::slice::from_raw_parts_mut(
-                            density_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
+                        let free_fraction = recip_denominator;
+                        free_fraction.copy_to_slice(std::slice::from_raw_parts_mut(free_fraction_ptr.add(i), SIMD_WIDTH));
+
+                        let mut new_densities = densities
+                            - (activities - activity_setpoints) * f32x8::splat(*plasticity_rate);
+                        new_densities = new_densities.simd_clamp(f32x8::splat(0.2), f32x8::splat(3.0));
+                        new_densities.copy_to_slice(std::slice::from_raw_parts_mut(density_ptr.add(i), SIMD_WIDTH));
 
                         if !feedback_accumulator_ptr.is_null() {
-                            let mut accumulator = f32x8::from_slice(std::slice::from_raw_parts(
-                                feedback_accumulator_ptr.add(i),
-                                SIMD_WIDTH,
-                            ));
-                            accumulator *= ones
-                                - (activities - point_fives * densities)
-                                    * f32x8::splat(*feedback_strength);
-                            accumulator.copy_to_slice(std::slice::from_raw_parts_mut(
-                                feedback_accumulator_ptr.add(i),
-                                SIMD_WIDTH,
-                            ));
+                            let mut accumulator = f32x8::from_slice(std::slice::from_raw_parts(feedback_accumulator_ptr.add(i), SIMD_WIDTH));
+                            accumulator *= ones - (activities - activity_setpoints) * f32x8::splat(*feedback_strength);
+                            accumulator.copy_to_slice(std::slice::from_raw_parts_mut(feedback_accumulator_ptr.add(i), SIMD_WIDTH));
                         }
                     }
                 }
             }
 
-            // PASS 2: SYSTEMS (The "Down" Pass)
             for instruction in &self.system_update_plan {
                 if let Instruction::UpdateSystem {
                     level_ptr,
@@ -235,33 +276,26 @@ impl Brain {
                 {
                     let synthesis_rate = *state.get(synthesis_rate_variable).unwrap_or(&0.1);
                     for i in (0..self.num_units).step_by(SIMD_WIDTH) {
-                        let mut levels = f32x8::from_slice(std::slice::from_raw_parts(
-                            level_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
-                        let feedback = f32x8::from_slice(std::slice::from_raw_parts(
-                            feedback_accumulator_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
+                        let mut levels =
+                            f32x8::from_slice(std::slice::from_raw_parts(level_ptr.add(i), SIMD_WIDTH));
+                        let feedback = f32x8::from_slice(std::slice::from_raw_parts(feedback_accumulator_ptr.add(i), SIMD_WIDTH));
                         levels += f32x8::splat(synthesis_rate) * feedback
                             - levels * f32x8::splat(*reuptake_eff);
                         levels = levels.simd_max(zeros);
-                        levels.copy_to_slice(std::slice::from_raw_parts_mut(
-                            level_ptr.add(i),
-                            SIMD_WIDTH,
-                        ));
+                        levels.copy_to_slice(std::slice::from_raw_parts_mut(level_ptr.add(i), SIMD_WIDTH));
                     }
                 }
             }
         }
     }
 
+    #[inline]
     pub fn get_sensor_value(&self, sensor_name: &str) -> Result<f32> {
         let plan = self
             .metric_plans
             .get(sensor_name)
-            .ok_or_else(|| anyhow!("Sensor '{}' not found", sensor_name))?;
-        let sum = plan.calculate_sum(&self.properties)?;
+            .ok_or_else(|| anyhow!("sensor '{}' not found", sensor_name))?;
+        let sum = plan.calculate_sum()?;
         let mean = sum / plan.count;
         if plan.subtract_from_one {
             Ok(1.0 - mean)
@@ -270,52 +304,6 @@ impl Brain {
         }
     }
 }
-
-mod utils {
-    use super::*;
-    pub(super) fn parse_metric_path(
-        path_str: &str,
-        property_map: &HashMap<String, usize>,
-        base_ptr: *const f32,
-        num_units: usize,
-    ) -> Result<*const f32> {
-        let (component_path, prop_name) = path_str
-            .split_once("::")
-            .ok_or_else(|| anyhow!("Metric path missing '::' in '{}'", path_str))?;
-        let base_idx = *property_map
-            .get(component_path)
-            .ok_or_else(|| anyhow!("Component path '{}' not found", component_path))?;
-        let prop_offset = match prop_name {
-            "activity" => 0,
-            "density" => 1,
-            "free_fraction" => 2,
-            _ => return Err(anyhow!("Unknown property: {}", prop_name)),
-        };
-        Ok(unsafe { base_ptr.add((base_idx + prop_offset) * num_units) })
-    }
-}
-
-#[derive(Clone, Debug)]
-enum Instruction {
-    UpdateReceptor {
-        activity_ptr: *mut f32,
-        density_ptr: *mut f32,
-        drug_effects: Vec<(usize, f32, f32)>,
-        feedback_accumulator_ptr: *mut f32,
-        feedback_strength: f32,
-        free_fraction_ptr: *mut f32,
-        nt_affinity_ki: f32,
-        parent_level_ptr: *const f32,
-        plasticity_rate: f32,
-    },
-    UpdateSystem {
-        feedback_accumulator_ptr: *const f32,
-        level_ptr: *mut f32,
-        reuptake_eff: f32,
-        synthesis_rate_variable: String,
-    },
-}
-
 
 #[derive(Debug)]
 struct MetricPlan {
@@ -364,18 +352,20 @@ impl MetricPlan {
         Ok(Self { subtract_from_one, prop1_ptr, prop2_ptr, count: num_units as f32 })
     }
 
-    fn calculate_sum(&self, _properties: &[f32]) -> Result<f32> {
+    #[inline]
+    fn calculate_sum(&self) -> Result<f32> {
         let sum: f32 = unsafe {
+            let count = self.count as usize;
             if self.prop2_ptr.is_null() {
-                let data_slice = std::slice::from_raw_parts(self.prop1_ptr, self.count as usize);
+                let data_slice = std::slice::from_raw_parts(self.prop1_ptr, count);
                 data_slice
                     .chunks_exact(SIMD_WIDTH)
                     .map(f32x8::from_slice)
                     .sum::<f32x8>()
                     .reduce_sum()
             } else {
-                let slice1 = std::slice::from_raw_parts(self.prop1_ptr, self.count as usize);
-                let slice2 = std::slice::from_raw_parts(self.prop2_ptr, self.count as usize);
+                let slice1 = std::slice::from_raw_parts(self.prop1_ptr, count);
+                let slice2 = std::slice::from_raw_parts(self.prop2_ptr, count);
                 slice1
                     .chunks_exact(SIMD_WIDTH)
                     .zip(slice2.chunks_exact(SIMD_WIDTH))
@@ -385,5 +375,29 @@ impl MetricPlan {
             }
         };
         Ok(sum)
+    }
+}
+
+mod utils {
+    use super::*;
+    pub(super) fn parse_metric_path(
+        path_str: &str,
+        property_map: &HashMap<String, usize>,
+        base_ptr: *const f32,
+        num_units: usize,
+    ) -> Result<*const f32> {
+        let (component_path, prop_name) = path_str
+            .split_once("::")
+            .ok_or_else(|| anyhow!("Metric path missing '::' in '{}'", path_str))?;
+        let base_idx = *property_map
+            .get(component_path)
+            .ok_or_else(|| anyhow!("Component path '{}' not found", component_path))?;
+        let prop_offset = match prop_name {
+            "activity" => 0,
+            "density" => 1,
+            "free_fraction" => 2,
+            _ => return Err(anyhow!("Unknown property: {}", prop_name)),
+        };
+        Ok(unsafe { base_ptr.add((base_idx + prop_offset) * num_units) })
     }
 }

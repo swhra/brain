@@ -19,7 +19,7 @@ mod program;
 
 use brain::Brain;
 use drug::{Drug, Logger, PIDController, PKModel};
-use program::{ControlLaw, Program};
+use program::{ActuatorDef, ControlLaw, Phase, Program};
 
 #[derive(Clone, Debug, Default)]
 struct SharedState {
@@ -27,6 +27,22 @@ struct SharedState {
     day: u64,
     phase: String,
     concentrations: Vec<f32>,
+}
+
+fn phase_introduces_drugs(phase: &Phase, actuators: &[ActuatorDef]) -> bool {
+    let drug_actuator_vars: Vec<_> =
+        actuators.iter().filter(|a| a.variable.ends_with("_dose_mg")).map(|a| &a.name).collect();
+
+    for modulator in &phase.modulators {
+        if drug_actuator_vars.contains(&&modulator.actuator) {
+            if let ControlLaw::Fixed { value } = &modulator.law {
+                if *value > 0.0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,8 +71,8 @@ fn main() -> anyhow::Result<()> {
         drug_order.iter().map(|name| (name.clone(), Drug::load(name, &drug_df).unwrap())).collect();
 
     eprintln!(
-        "\x1b[1;34m-> Initializing brain with {} synaptic units...\x1b[0m",
-        program.globals.num_synaptic_units
+        "\x1b[1;34m-> Initializing brain with {} synapses...\x1b[0m",
+        program.globals.synapses
     );
     let mut brain = Brain::new(&program, &drugs, &drug_order)?;
     eprintln!("\x1b[32m-> Initialization complete. Starting simulation.\x1b[0m");
@@ -84,10 +100,11 @@ fn main() -> anyhow::Result<()> {
             let elapsed_ms = start_time.elapsed().as_millis();
 
             eprint!("\x1b[1;33m");
-            eprint!("elapsed: {}ms\tphase: {}\tday: {}\ttick: {}",
+            eprint!(
+                "elapsed: {}ms\tphase: {}\tday: {}\ttick: {}",
                 elapsed_ms, state.phase, state.day, state.tick
             );
-            for (drug, conc) in state.concentrations.iter().zip(signal_drug_order.iter()) {
+            for (drug, conc) in signal_drug_order.iter().zip(state.concentrations.iter()) {
                 eprint!("\t{}: {:.4}nM", drug, conc);
             }
             eprint!("\x1b[0m\n");
@@ -95,23 +112,50 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut tick_counter: u64 = 0;
-    let mut sensor_cache: HashMap<String, f32> = HashMap::new();
     let mut concentrations_ordered: Vec<f32> = vec![0.0; drug_order.len()];
     let mut doses_ordered: Vec<f32> = vec![0.0; drug_order.len()];
 
+    let mut sensor_cache: HashMap<String, f32> = HashMap::new();
+    for sensor in &program.sensors {
+        sensor_cache.insert(sensor.name.clone(), brain.get_sensor_value(&sensor.name)?);
+    }
+
+    let mut setpoints_captured = false;
+
     for (phase_idx, phase) in program.phases.iter().enumerate() {
         eprintln!(
-            "\n\x1b[1;35m--- Phase {}/{} [{}]: {} days ---\x1b[0m",
-            phase_idx + 1, program.phases.len(), phase.description, phase.duration_days
+            "\n\x1b[1;35m[{}/{}] {}: {} days\x1b[0m",
+            phase_idx + 1,
+            program.phases.len(),
+            phase.description,
+            phase.duration_days
         );
 
-        { let mut state = shared_state.lock().unwrap(); state.phase = phase.description.clone(); }
+        if !setpoints_captured && phase_introduces_drugs(phase, &program.actuators) {
+            eprintln!(
+                "\x1b[1;34m-> First drug-taking phase detected. Capturing homeostatic setpoints...\x1b[0m"
+            );
+            brain.capture_activity_setpoints();
+            setpoints_captured = true;
+        }
+
+        {
+            let mut state = shared_state.lock().unwrap();
+            state.phase = phase.description.clone();
+        }
 
         let mut controllers: HashMap<String, PIDController> = HashMap::new();
         for modulator in &phase.modulators {
             if let ControlLaw::Pid { target, .. } = &modulator.law {
-                let target_val = if target == "stabilize" { *sensor_cache.get(modulator.sensor.as_ref().unwrap()).unwrap_or(&0.0) } else { target.parse()? };
-                controllers.insert(modulator.actuator.clone(), PIDController::new(target_val, &modulator.law));
+                let target_val = if target == "stabilize" {
+                    *sensor_cache.get(modulator.sensor.as_ref().unwrap()).unwrap_or(&0.0)
+                } else {
+                    target.parse()?
+                };
+                controllers.insert(
+                    modulator.actuator.clone(),
+                    PIDController::new(target_val, &modulator.law),
+                );
             }
         }
 
@@ -121,37 +165,48 @@ fn main() -> anyhow::Result<()> {
             .progress_chars("#>-"));
 
         for day in 1..=phase.duration_days {
-            { let mut state = shared_state.lock().unwrap(); state.day = day; }
+            {
+                let mut state = shared_state.lock().unwrap();
+                state.day = day;
+            }
 
-            // --- CONTROL LOGIC LOOP (runs once per day) ---
             for modulator in &phase.modulators {
-                let actuator_def = program.actuators.iter().find(|a| a.name == modulator.actuator).ok_or_else(|| anyhow!("actuator '{}' not found", modulator.actuator))?;
+                let actuator_def = program
+                    .actuators
+                    .iter()
+                    .find(|a| a.name == modulator.actuator)
+                    .ok_or_else(|| anyhow!("actuator '{}' not found", modulator.actuator))?;
 
                 if let Some(current_val_ref) = runtime_state.get_mut(&actuator_def.variable) {
-                let new_val = match &modulator.law {
-                    ControlLaw::Fixed { value } => *value,
-                    ControlLaw::Pid { .. } => {
-                            let sensor_def = program.sensors.iter().find(|s| s.name == *modulator.sensor.as_ref().unwrap()).unwrap();
-                        let sensor_val = brain.get_sensor_value(&sensor_def.name)?;
-                        let controller = controllers.get_mut(&modulator.actuator).unwrap();
+                    let new_val = match &modulator.law {
+                        ControlLaw::Fixed { value } => *value,
+                        ControlLaw::Pid { .. } => {
+                            let sensor_name = modulator.sensor.as_ref().unwrap();
+                            let sensor_val = *sensor_cache.get(sensor_name).ok_or_else(|| {
+                                anyhow!("Sensor '{}' not found in cache", sensor_name)
+                            })?;
+                            let controller = controllers.get_mut(&modulator.actuator).unwrap();
                             *current_val_ref + controller.calculate_adjustment(sensor_val)
-                    }
-                };
+                        }
+                    };
                     *current_val_ref = new_val;
-            }
+                }
             }
 
             for (i, drug_name) in drug_order.iter().enumerate() {
                 let dose_key = format!("{}_dose_mg", drug_name);
-                doses_ordered[i] = *runtime_state.get(&dose_key).unwrap_or(&0.0) / brain::TICKS_PER_DAY as f32;
+                doses_ordered[i] =
+                    *runtime_state.get(&dose_key).unwrap_or(&0.0) / program.globals.tick_freq as f32;
             }
 
-            for _ in 0..brain::TICKS_PER_DAY {
+            let initial_tick_of_day = tick_counter;
+
+            for _ in 0..program.globals.tick_freq {
                 tick_counter += 1;
 
                 for (i, drug_name) in drug_order.iter().enumerate() {
                     let pk_model = pk_models.get_mut(drug_name).unwrap();
-                    pk_model.add_dose(doses_ordered[i]); // Use pre-calculated dose
+                    pk_model.add_dose(doses_ordered[i]);
                     pk_model.tick();
                     concentrations_ordered[i] = pk_model.concentration_nm;
                 }
@@ -163,18 +218,35 @@ fn main() -> anyhow::Result<()> {
                     state.tick = tick_counter;
                     state.concentrations.copy_from_slice(&concentrations_ordered);
                 }
+            }
 
-                if tick_counter % program.globals.log_interval_ticks == 0 {
-                    let sensor_values: Vec<f32> = program.sensors.iter().map(|s| brain.get_sensor_value(&s.name).unwrap_or(0.0)).collect();
-                    logger.log_data(tick_counter, day, &phase.description, &runtime_state, &sensor_values)?;
+            let logs_at_start_of_day = initial_tick_of_day / program.globals.log_freq;
+            let logs_at_end_of_day = tick_counter / program.globals.log_freq;
+
+            if logs_at_end_of_day > logs_at_start_of_day {
+                let sensor_values: Vec<f32> = program
+                    .sensors
+                    .iter()
+                    .map(|s| sensor_cache.get(&s.name).map(|v| *v).unwrap_or(0f32))
+                    .collect();
+
+                for (sensor, &value) in program.sensors.iter().zip(&sensor_values) {
+                    sensor_cache.insert(sensor.name.clone(), value);
                 }
+
+                logger.log_data(
+                    tick_counter,
+                    day,
+                    &phase.description,
+                    &runtime_state,
+                    &sensor_values,
+                )?;
             }
             pb.inc(1);
         }
-
         pb.finish_with_message("Phase complete.");
-        logger.flush()?;
 
+        logger.flush()?;
         for sensor in &program.sensors {
             sensor_cache.insert(sensor.name.clone(), brain.get_sensor_value(&sensor.name)?);
         }

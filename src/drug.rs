@@ -74,51 +74,60 @@ pub struct DrugTarget {
 #[derive(Clone, Debug)]
 pub struct PKModel {
     pub concentration_nm: f32,
-    absorption_rate: f32,
-    elimination_rate: f32,
+    absorption_multiplier: f32,
+    elimination_multiplier: f32,
     conc_per_mg: f32,
     dose_queue: f32,
 }
 
 impl PKModel {
     pub fn new(p: &DrugParams) -> Self {
+        let absorption_rate = 0.693 / (p.absorption_half_life_hours * 3600.0);
+        let elimination_rate = 0.693 / (p.half_life_hours * 3600.0);
+
         Self {
             concentration_nm: 0.0,
-            absorption_rate: 0.693 / (p.absorption_half_life_hours * 3600.0),
-            elimination_rate: 0.693 / (p.half_life_hours * 3600.0),
+            absorption_multiplier: 1.0 - (-absorption_rate).exp(),
+            elimination_multiplier: (-elimination_rate).exp(),
             conc_per_mg: p.concentration_per_mg,
             dose_queue: 0.0,
         }
     }
+
     #[inline(always)]
     pub fn add_dose(&mut self, dose_mg: f32) {
         self.dose_queue += dose_mg;
     }
+
     #[inline(always)]
     pub fn tick(&mut self) {
-        let to_absorb = self.dose_queue * self.absorption_rate;
+        let to_absorb = self.dose_queue * self.absorption_multiplier;
         self.dose_queue -= to_absorb;
         self.concentration_nm += to_absorb * self.conc_per_mg;
-        self.concentration_nm -= self.concentration_nm * self.elimination_rate;
+        self.concentration_nm *= self.elimination_multiplier;
     }
 }
 
 pub struct Logger {
-    pub writer: BufWriter<std::io::Stdout>,
+    writer: BufWriter<std::io::Stdout>,
+    sorted_state_keys: Vec<String>,
 }
+
 impl Logger {
     pub fn new() -> Self {
-        Self { writer: BufWriter::new(stdout()) }
+        Self { writer: BufWriter::new(stdout()), sorted_state_keys: Vec::new() }
     }
+
     pub fn log_header(
         &mut self,
         state: &HashMap<String, f32>,
         sensors: &[crate::program::SensorDef],
     ) -> std::io::Result<()> {
         write!(self.writer, "tick,day,phase")?;
-        let mut sorted_keys: Vec<_> = state.keys().collect();
-        sorted_keys.sort();
-        for key in sorted_keys {
+        self.sorted_state_keys = state.keys().cloned().collect();
+        self.sorted_state_keys.sort();
+
+        for key in &self.sorted_state_keys {
             write!(self.writer, ",{}", key)?;
         }
         for sensor in sensors {
@@ -126,6 +135,7 @@ impl Logger {
         }
         writeln!(self.writer)
     }
+
     pub fn log_data(
         &mut self,
         tick: u64,
@@ -135,9 +145,9 @@ impl Logger {
         sensor_vals: &[f32],
     ) -> std::io::Result<()> {
         write!(self.writer, "{},{},{}", tick, day, phase)?;
-        let mut sorted_keys: Vec<_> = state.keys().collect();
-        sorted_keys.sort();
-        for key in sorted_keys {
+
+        // --- OPTIMIZATION 3: Use the pre-sorted key list ---
+        for key in &self.sorted_state_keys {
             write!(self.writer, ",{:.2}", state.get(key).unwrap_or(&0.0))?;
         }
         for val in sensor_vals {
@@ -145,6 +155,7 @@ impl Logger {
         }
         writeln!(self.writer)
     }
+
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
     }

@@ -1,0 +1,121 @@
+globals:
+  # Simulate at a 1-minute resolution (1440 ticks per day).
+  tick_freq: 1440
+  # Log data every 60 ticks (once per hour).
+  log_freq: 60
+  # 65,536 synapses.
+  synapses: 65536
+
+drugs:
+  sertraline:
+    half_life_hours: 26.0
+    absorption_half_life_hours: 4.5
+    # Adjusted for more realistic plasma concentration (~150nM @ 100mg).
+    concentration_per_mg: 1.5
+
+components:
+  # This model focuses on the striatum, a key area for reward and motivation,
+  # known to be affected by SSRIs.
+  - { name: striatum, type: region }
+
+  # Serotonin (5-HT) system with reuptake and synthesis.
+  - { name: striatum.serotonin, type: system, parent: striatum, params: { reuptake: 0.05 } }
+
+  # The Serotonin Transporter (SERT), the primary target of sertraline.
+  # Its density will change over time due to homeostatic plasticity.
+  - { name: striatum.serotonin.sert, type: receptor, parent: striatum.serotonin, params: { plasticity: 1.0e-8 } }
+
+  # A presynaptic 5-HT2C autoreceptor. When activated, it reduces serotonin synthesis.
+  # This is a key homeostatic feedback mechanism.
+  - { name: striatum.serotonin.5ht2c, type: receptor, parent: striatum.serotonin, receptor_type: presynaptic, params: { feedback: 1.2, plasticity: 5.0e-9 } }
+
+  # A simplified dopamine system to monitor for off-target effects.
+  - { name: striatum.dopamine, type: system, parent: striatum }
+  - { name: striatum.dopamine.dat, type: receptor, parent: striatum.dopamine }
+
+state:
+  sertraline_dose_mg: 0.0
+  # This is the variable controlled by the homeostatic PID controller.
+  striatum_serotonin_synthesis_rate: 0.1
+
+sensors:
+  # Measures the percentage of SERT transporters that are blocked by the drug.
+  # This is the most direct measure of the drug's primary effect.
+  - name: "sert_occupancy_pct"
+    metric: "1.0 - mean(striatum.serotonin.sert::free_fraction)"
+
+  # Monitors the net activity of the SERT system. The brain's goal (via the PID
+  # controller) is to keep this value stable at 0.5. Deviations from this
+  # setpoint can be interpreted as a withdrawal or adaptation signal.
+  - name: "sert_activity_monitor"
+    metric: "mean(striatum.serotonin.sert::activity)"
+
+  # Tracks changes in the number of SERT transporters. This represents the brain's
+  # long-term adaptation to the drug.
+  - name: "sert_density"
+    metric: "mean(striatum.serotonin.sert::density)"
+
+  # Monitors sertraline's weaker effect on dopamine transporters.
+  - name: "dat_occupancy_pct"
+    metric: "1.0 - mean(striatum.dopamine.dat::free_fraction)"
+
+actuators:
+  - { name: "sertraline_dose", variable: "sertraline_dose_mg" }
+  - { name: "serotonin_synthesis_control", variable: "striatum_serotonin_synthesis_rate" }
+
+phases:
+  - description: "Phase_1_Baseline"
+    duration_days: 30
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }
+      # The PID controller stabilizes the serotonin system to its natural setpoint.
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "stabilize", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 }
+
+  - description: "Phase_2_Stabilize_100mg"
+    duration_days: 90
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 100.0 } }
+      # The PID controller now works to counteract the effect of the drug, trying to restore the activity setpoint of 0.5.
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 }
+
+  # This section implements a smooth, gradual linear taper by reducing the dose
+  # by ~4.17mg each week. This is a strong test of the linear taper model.
+  - { description: "Taper_Week_01", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 95.83 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_02", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 91.66 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_03", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 87.49 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_04", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 83.32 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_05", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 79.15 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_06", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 74.98 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_07", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 70.81 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_08", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 66.64 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_09", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 62.47 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_10", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 58.30 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_11", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 54.13 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_12", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 49.96 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_13", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 45.79 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_14", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 41.62 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_15", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 37.45 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_16", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 33.28 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_17", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 29.11 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_18", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 24.94 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_19", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 20.77 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_20", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 16.60 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_21", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 12.43 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_22", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 8.26 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  - { description: "Taper_Week_23", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 4.09 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+  # The final week of the taper brings the dose to zero.
+  - { description: "Taper_Week_24_Final", duration_days: 7, modulators: [{ actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }, { actuator: "serotonin_synthesis_control", sensor: "sert_activity_monitor", law: { type: pid, target: "0.5", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 } }] }
+
+  - description: "Phase_4_Final_Washout"
+    duration_days: 90
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }
+      # The PID controller will now attempt to guide the system back to its
+      # original baseline after the drug is completely removed.
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "stabilize", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 }

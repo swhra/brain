@@ -1,0 +1,81 @@
+globals:
+  tick_freq: 1440
+  log_freq: 60
+  synapses: 65536
+
+drugs:
+  sertraline:
+    half_life_hours: 26.0
+    absorption_half_life_hours: 4.5
+    concentration_per_mg: 1.5
+
+components:
+  - { name: striatum, type: region }
+  - { name: striatum.serotonin, type: system, parent: striatum, params: { reuptake: 0.05 } }
+
+  - name: striatum.serotonin.sert
+    type: receptor
+    target: "Transporter.SERT"
+    parent: striatum.serotonin
+    params:
+      affinity: 250.0
+      plasticity: 5.0e-6
+
+  - name: striatum.serotonin.5ht2c
+    type: receptor
+    target: "GPCR.Monoamine.Serotonin.5HT2C"
+    parent: striatum.serotonin
+    receptor_type: presynaptic
+    params:
+      feedback: 1.2
+      plasticity: 5.0e-9
+
+  - { name: striatum.dopamine, type: system, parent: striatum }
+
+  - name: striatum.dopamine.dat
+    type: receptor
+    target: "Transporter.DAT"
+    parent: striatum.dopamine
+
+state:
+  sertraline_dose_mg: 0.0
+  striatum_serotonin_synthesis_rate: 0.1
+
+sensors:
+  - name: "sert_occupancy_pct"
+    metric: "1.0 - mean(striatum.serotonin.sert::free_fraction)"
+  - name: "sert_activity_monitor"
+    metric: "mean(striatum.serotonin.sert::activity)"
+  - name: "sert_density"
+    metric: "mean(striatum.serotonin.sert::density)"
+  - name: "dat_occupancy_pct"
+    metric: "1.0 - mean(striatum.dopamine.dat::free_fraction)"
+
+actuators:
+  - { name: "sertraline_dose", variable: "sertraline_dose_mg" }
+  - { name: "serotonin_synthesis_control", variable: "striatum_serotonin_synthesis_rate" }
+
+phases:
+  - description: "Phase_1_Baseline"
+    duration_days: 30
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "stabilize", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 }
+
+  - description: "Phase_2_Chronic_Treatment_100mg"
+    duration_days: 365
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 100.0 } }
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "stabilize", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 }
+
+  - description: "Phase_3_Post_Cessation_Followup"
+    duration_days: 365
+    modulators:
+      - { actuator: "sertraline_dose", law: { type: fixed, value: 0.0 } }
+      - actuator: "serotonin_synthesis_control"
+        sensor: "sert_activity_monitor"
+        law: { type: pid, target: "stabilize", kp: -0.002, ki: -0.0002, kd: 0.0, step: 0.0 }

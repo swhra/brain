@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ActuatorDef {
@@ -13,6 +12,7 @@ pub struct ComponentDef {
     pub name: String,
     #[serde(rename = "type")]
     pub component_type: String,
+    pub target: Option<String>,
     pub parent: Option<String>,
     #[serde(rename = "receptor_type")]
     pub receptor_type: Option<ReceptorDef>,
@@ -61,8 +61,9 @@ pub struct Program {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProgramGlobals {
-    pub num_synaptic_units: usize,
-    pub log_interval_ticks: u64,
+    pub synapses: usize,
+    pub tick_freq: u64,
+    pub log_freq: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
