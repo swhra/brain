@@ -1,5 +1,6 @@
-use serde::Deserialize;
 use std::collections::HashMap;
+
+use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ActuatorDef {
